@@ -812,7 +812,7 @@ def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id:
                     <span>AI Interviewer Active</span>
                 </div>
                 <button id="voiceBtn" class="play-btn" onclick="toggleAudio()">
-                    <span>🔊</span> <span id="btnLabel">{btn_label}</span>
+                    <span id="btnIcon">🔁</span> <span id="btnLabel">Repeat Question</span>
                 </button>
             </div>
             
@@ -827,9 +827,11 @@ def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id:
             const QUESTION_TEXT = {question_json};
             const HAS_SERVER_AUDIO = {has_audio_js};
 
-            function setLabel(txt) {{
+            function setButtonState(icon, text) {{
                 const label = document.getElementById('btnLabel');
-                if (label) label.innerText = txt;
+                const ic = document.getElementById('btnIcon');
+                if (label) label.innerText = text;
+                if (ic) ic.innerText = icon;
             }}
 
             function startVideo() {{
@@ -843,16 +845,18 @@ def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id:
             }}
 
             // Tier 3: Browser-Native Speech Synthesis
-            function browserSpeak() {{
+            function browserSpeak(forceRestart = false) {{
                 if (!('speechSynthesis' in window)) {{
-                    setLabel('Voice unsupported');
+                    setButtonState('⚠️', 'Voice unsupported');
                     return;
                 }}
                 if (window.speechSynthesis.speaking) {{
                     window.speechSynthesis.cancel();
-                    stopVideo();
-                    setLabel('Play Audio');
-                    return;
+                    if (!forceRestart) {{
+                        stopVideo();
+                        setButtonState('🔁', 'Repeat Question');
+                        return;
+                    }}
                 }}
                 const utter = new SpeechSynthesisUtterance(QUESTION_TEXT);
                 utter.lang = 'en-US';
@@ -865,32 +869,45 @@ def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id:
                 ) || voices.find(v => /^en/i.test(v.lang));
                 if (preferred) utter.voice = preferred;
 
-                utter.onstart = () => {{ setLabel('Pause Audio'); startVideo(); }};
-                utter.onend   = () => {{ setLabel('Replay Audio'); stopVideo(); }};
+                utter.onstart = () => {{ setButtonState('⏸️', 'Pause Audio'); startVideo(); }};
+                utter.onend   = () => {{ setButtonState('🔁', 'Repeat Question'); stopVideo(); }};
                 utter.onerror = (e) => {{
                     console.error("speechSynthesis error:", e);
-                    setLabel('Voice unavailable');
+                    setButtonState('🔁', 'Repeat Question');
                 }};
                 window.speechSynthesis.speak(utter);
             }}
 
             // Tiers 1 & 2: Server-Synthesized Audio
             function toggleAudio() {{
-                if (!HAS_SERVER_AUDIO) {{ browserSpeak(); return; }}
+                if (!HAS_SERVER_AUDIO) {{
+                    browserSpeak(true);
+                    return;
+                }}
 
                 const audio = document.getElementById('recruiterAudio');
-                if (!audio) {{ browserSpeak(); return; }}
+                if (!audio) {{
+                    browserSpeak(true);
+                    return;
+                }}
 
-                if (audio.paused) {{
+                if (audio.paused || audio.ended) {{
+                    if (audio.ended || audio.currentTime > 0) {{
+                        audio.currentTime = 0;
+                    }}
                     audio.play()
-                        .then(() => {{ setLabel('Pause Audio'); startVideo(); }})
+                        .then(() => {{
+                            setButtonState('⏸️', 'Pause Audio');
+                            startVideo();
+                        }})
                         .catch(e => {{
                             console.error("Audio element playback failed:", e);
-                            browserSpeak();
+                            browserSpeak(true);
                         }});
                 }} else {{
                     audio.pause();
-                    setLabel('Play Audio');
+                    setButtonState('🔁', 'Repeat Question');
+                    stopVideo();
                 }}
             }}
 
@@ -901,23 +918,41 @@ def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id:
                 }}
 
                 const audio = document.getElementById('recruiterAudio');
-                if (!audio) {{
-                    setLabel(HAS_SERVER_AUDIO ? 'Play Audio' : '🔊 Speak Question');
-                    return;
+                if (audio) {{
+                    audio.addEventListener('playing', () => {{
+                        setButtonState('⏸️', 'Pause Audio');
+                        startVideo();
+                    }});
+                    audio.addEventListener('pause', () => {{
+                        setButtonState('🔁', 'Repeat Question');
+                        const video = document.getElementById('avatarVideo');
+                        if (video) video.pause();
+                    }});
+                    audio.addEventListener('ended', () => {{
+                        setButtonState('🔁', 'Repeat Question');
+                        stopVideo();
+                    }});
+                    audio.addEventListener('error', (err) => {{
+                        console.error("Audio element error:", err);
+                        setButtonState('🔁', 'Repeat Question');
+                    }});
+
+                    // Autoplay initial interviewer voice immediately when question appears
+                    audio.play()
+                        .then(() => {{
+                            setButtonState('⏸️', 'Pause Audio');
+                            startVideo();
+                        }})
+                        .catch(e => {{
+                            console.warn("Initial autoplay deferred by browser policy:", e);
+                            setButtonState('🔁', 'Repeat Question');
+                        }});
+                }} else {{
+                    // Fallback to browser-native speech synthesis
+                    setTimeout(() => {{
+                        browserSpeak(false);
+                    }}, 250);
                 }}
-
-                audio.addEventListener('playing', () => {{ setLabel('Pause Audio'); startVideo(); }});
-                audio.addEventListener('pause',   () => setLabel('Play Audio'));
-                audio.addEventListener('ended',   () => {{ setLabel('Replay Audio'); stopVideo(); }});
-                audio.addEventListener('error',   (err) => {{
-                    console.error("Audio element error:", err);
-                    setLabel('🔊 Speak Question');
-                }});
-
-                audio.play().catch(e => {{
-                    console.warn("Autoplay blocked by browser policy:", e);
-                    setLabel('🔊 Play Audio');
-                }});
             }});
         </script>
     </body>
@@ -1316,32 +1351,6 @@ elif st.session_state.stage == "interview":
             audio_mime=media_data.get("mime") or "audio/mp3",
             engine=media_data.get("engine") or "browser",
         )
-
-        # Native Streamlit audio component underneath avatar card (handles HTTPS and cross-origin policies)
-        raw_audio_data = media_data.get("raw_bytes")
-        if raw_audio_data is None and media_data.get("b64"):
-            try:
-                raw_b64 = media_data["b64"].split(",")[-1]
-                raw_audio_data = base64.b64decode(raw_b64)
-            except Exception:
-                raw_audio_data = None
-
-        if raw_audio_data:
-            engine_label = {
-                "gemini": "Gemini Native TTS",
-                "gtts": "Google TTS",
-            }.get(media_data.get("engine"), "Voice")
-            st.markdown(
-                "<div style='margin-top: -6px; margin-bottom: 6px;'>"
-                "<span class='font-mono-tag' style='color: #94a3b8; font-size: 0.74rem;'>"
-                f"🔊 Interviewer Voice Player &middot; {engine_label}</span></div>",
-                unsafe_allow_html=True,
-            )
-            st.audio(
-                raw_audio_data,
-                format=media_data.get("mime") or "audio/mp3",
-                autoplay=True,
-            )
 
     with col_right:
         # Question Context Card
