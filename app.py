@@ -559,6 +559,26 @@ def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id:
                 50% {{ transform: scale(1.3); opacity: 0.5; }}
                 100% {{ transform: scale(0.9); opacity: 1; }}
             }}
+            .play-btn {{
+                background: #494bd6;
+                border: 1px solid rgba(255, 255, 255, 0.25);
+                color: #ffffff;
+                padding: 6px 14px;
+                border-radius: 8px;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 0.76rem;
+                font-weight: 600;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                box-shadow: 0 4px 14px rgba(73, 75, 214, 0.45);
+                transition: all 0.2s ease;
+            }}
+            .play-btn:hover {{
+                background: #6f00be;
+                transform: scale(1.02);
+            }}
             .subtitle-overlay {{
                 position: relative;
                 z-index: 10;
@@ -593,9 +613,9 @@ def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id:
                     <span class="pulse-dot"></span>
                     <span>AI Interviewer Active</span>
                 </div>
-                <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; color: #94a3b8; background: rgba(0,0,0,0.5); padding: 4px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1);">
-                    Simli WebRTC Live
-                </div>
+                <button id="voiceBtn" class="play-btn">
+                    <span>🔊</span> <span id="btnLabel">Play Audio</span>
+                </button>
             </div>
             
             <div class="subtitle-overlay">
@@ -608,10 +628,43 @@ def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id:
         <script>
             const video = document.getElementById('avatarVideo');
             const audio = document.getElementById('recruiterAudio');
+            const btn = document.getElementById('voiceBtn');
+            const label = document.getElementById('btnLabel');
+
+            function toggleAudio() {{
+                if (!audio) return;
+                if (audio.paused) {{
+                    audio.play().then(() => {{
+                        if (label) label.innerText = 'Pause Audio';
+                        if (video) video.play();
+                    }}).catch(err => console.log('Autoplay policy error:', err));
+                }} else {{
+                    audio.pause();
+                    if (label) label.innerText = 'Play Audio';
+                }}
+            }}
+
+            if (btn) {{
+                btn.addEventListener('click', toggleAudio);
+            }}
+
             if (audio && video) {{
-                audio.addEventListener('play', () => {{ video.play().catch(e => console.log(e)); }});
-                audio.addEventListener('pause', () => {{ video.pause(); }});
-                audio.addEventListener('ended', () => {{ video.pause(); video.currentTime = 0; }});
+                audio.addEventListener('play', () => {{
+                    if (label) label.innerText = 'Playing...';
+                    video.play().catch(e => console.log(e));
+                }});
+                audio.addEventListener('pause', () => {{
+                    if (label) label.innerText = 'Play Audio';
+                }});
+                audio.addEventListener('ended', () => {{
+                    if (label) label.innerText = 'Replay Audio';
+                    video.pause();
+                    video.currentTime = 0;
+                }});
+                // Attempt initial autoplay if allowed
+                audio.play().catch(() => {{
+                    if (label) label.innerText = '🔊 Click to Play';
+                }});
             }}
         </script>
     </body>
@@ -637,7 +690,12 @@ def transcribe_candidate_audio(audio_bytes: bytes, api_key: str, model_name: str
         )
         return (response.text or "").strip()
     except Exception as e:
-        st.warning(f"Voice Transcription Notice: {e}")
+        err_str = str(e)
+        if "401" in err_str or "UNAUTHENTICATED" in err_str or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in err_str:
+            st.error("🔑 **Authentication Notice**: The Google API key is invalid or unauthorized for Gemini. Please configure a valid Google AI Studio API key (starts with `AIzaSy...`). You can also type or edit your answer directly below.")
+        else:
+            st.warning(f"Voice Transcription Notice: {err_str[:120]}")
+        return ""
         return ""
 
 # -----------------------------------------------------------------------------
@@ -961,6 +1019,13 @@ elif st.session_state.stage == "interview":
             audio_b64=media_data.get("b64"),
             face_id=simli_face_id
         )
+        if media_data and media_data.get("b64"):
+            try:
+                raw_b64 = media_data["b64"].split(",")[-1]
+                audio_raw_bytes = base64.b64decode(raw_b64)
+                st.audio(audio_raw_bytes, format="audio/mp3")
+            except Exception:
+                pass
 
     with col_right:
         # Question Context Card
