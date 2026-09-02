@@ -5,6 +5,7 @@ import base64
 import hashlib
 import time
 import io
+import wave
 import datetime
 import requests
 import streamlit as st
@@ -286,6 +287,8 @@ def init_session_state():
         "draft_answer": "",
         "media_cache": {},
         "last_audio_hash": "",
+        "voice_engine": "",
+        "voice_errors": [],
         "evaluation": None,
         "active_api_key": "",
         "provider": "Google Gemini",
@@ -307,6 +310,8 @@ def reset_interview():
     st.session_state.draft_answer = ""
     st.session_state.media_cache = {}
     st.session_state.last_audio_hash = ""
+    st.session_state.voice_engine = ""
+    st.session_state.voice_errors = []
     st.session_state.evaluation = None
     st.rerun()
 
@@ -445,28 +450,156 @@ def get_canned_questions(job_title: str, focus: str, count: int) -> list:
     return bank[:count]
 
 # -----------------------------------------------------------------------------
-# Audio & Simli Real-Time Avatar Generation
+# Audio & Simli Real-Time Avatar Generation (Three-Tier Voice Engine)
 # -----------------------------------------------------------------------------
-def generate_gtts_audio(text: str) -> tuple[bytes | None, str | None]:
-    """Generates MP3 audio using gTTS and returns (raw_bytes, base64_data_uri)."""
+GEMINI_TTS_MODELS = (
+    "gemini-2.5-flash-preview-tts",
+    "gemini-2.5-flash-tts",
+    "gemini-2.5-pro-preview-tts",
+)
+GEMINI_TTS_VOICE = "Charon"  # Professional tone for Alex Rivera persona
+
+def _clean_for_speech(text: str) -> str:
+    """Strips markdown and punctuation artifacts for clean speech synthesis."""
+    cleaned = re.sub(r"[*_#`~>]", " ", text or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000,
+                channels: int = 1, sample_width: int = 2) -> bytes:
+    """Wraps raw 16-bit headerless PCM audio into a standard RIFF/WAV container."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+def _sample_rate_from_mime(mime: str, fallback: int = 24000) -> int:
+    """Parses sample rate from mime type e.g. 'audio/L16;rate=24000' -> 24000."""
+    match = re.search(r"rate=(\d+)", mime or "")
+    return int(match.group(1)) if match else fallback
+
+def generate_gemini_tts_audio(text: str, api_key: str) -> tuple[bytes | None, str, str]:
+    """
+    TIER 1: Synthesizes speech with Gemini's native authenticated TTS models.
+    Returns (audio_bytes, mime_type, error_message).
+    """
+    if not GEMINI_AVAILABLE:
+        return None, "", "google-genai SDK not installed."
+    if not api_key:
+        return None, "", "No GEMINI_API_KEY configured."
+
+    client = get_gemini_client(api_key)
+    if not client:
+        return None, "", "Could not initialize Gemini client."
+
+    speech_text = _clean_for_speech(text)
+    last_error = ""
+
+    for tts_model in GEMINI_TTS_MODELS:
+        try:
+            config = types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=GEMINI_TTS_VOICE
+                        )
+                    )
+                ),
+            )
+            response = client.models.generate_content(
+                model=tts_model,
+                contents=speech_text,
+                config=config,
+            )
+
+            inline = None
+            for candidate in (response.candidates or []):
+                for part in (getattr(candidate.content, "parts", None) or []):
+                    if getattr(part, "inline_data", None) and part.inline_data.data:
+                        inline = part.inline_data
+                        break
+                if inline:
+                    break
+
+            if not inline:
+                last_error = f"{tts_model}: response contained no audio part."
+                continue
+
+            raw = inline.data
+            mime = (inline.mime_type or "").lower()
+
+            if "l16" in mime or "pcm" in mime or not mime.startswith("audio/"):
+                raw = _pcm_to_wav(raw, sample_rate=_sample_rate_from_mime(mime))
+                mime = "audio/wav"
+
+            return raw, mime, ""
+
+        except Exception as exc:
+            last_error = f"{tts_model}: {exc}"
+            continue
+
+    return None, "", f"Gemini TTS unavailable: {last_error}"
+
+def generate_gtts_audio(text: str) -> tuple[bytes | None, str | None, str]:
+    """
+    TIER 2: Google Translate TTS.
+    Returns (raw_bytes, base64_data_uri, error_message).
+    """
     if not GTTS_AVAILABLE:
-        return None, None
+        return None, None, "gTTS is not installed in this environment."
     try:
-        clean_text = re.sub(r'[*_#`~]', '', text)
-        tts = gTTS(text=clean_text, lang='en', tld='com')
+        tts = gTTS(text=_clean_for_speech(text), lang="en", tld="com")
         fp = io.BytesIO()
         tts.write_to_fp(fp)
         fp.seek(0)
         raw_bytes = fp.read()
+        if not raw_bytes:
+            return None, None, "gTTS returned empty audio stream."
         b64_data = base64.b64encode(raw_bytes).decode("utf-8")
-        return raw_bytes, f"data:audio/mp3;base64,{b64_data}"
-    except Exception:
-        return None, None
+        return raw_bytes, f"data:audio/mp3;base64,{b64_data}", ""
+    except Exception as exc:
+        detail = str(exc)
+        if "429" in detail or "Too Many Requests" in detail:
+            detail = "Google Translate rejected request with HTTP 429 (shared cloud IP rate limit)."
+        return None, None, f"gTTS failed: {detail}"
 
 def generate_gtts_audio_base64(text: str) -> str | None:
-    """Convenience helper returning base64 URI."""
-    _, uri = generate_gtts_audio(text)
+    _, uri, _ = generate_gtts_audio(text)
     return uri
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=64)
+def synthesize_speech(text: str, api_key: str, prefer: str = "gemini") -> dict:
+    """
+    Orchestrates the 3-tier voice engine and always returns a usable result.
+    Returns: {"bytes": raw, "b64": uri, "mime": mime, "engine": 'gemini'|'gtts'|'browser', "errors": []}
+    """
+    errors: list[str] = []
+    order = ["gemini", "gtts"] if prefer == "gemini" else ["gtts", "gemini"]
+
+    for engine in order:
+        if engine == "gemini":
+            raw, mime, err = generate_gemini_tts_audio(text, api_key)
+            if raw:
+                b64 = base64.b64encode(raw).decode("utf-8")
+                return {"bytes": raw, "b64": f"data:{mime};base64,{b64}",
+                        "mime": mime, "engine": "gemini", "errors": errors}
+            if err:
+                errors.append(err)
+        else:
+            raw, uri, err = generate_gtts_audio(text)
+            if raw:
+                return {"bytes": raw, "b64": uri, "mime": "audio/mp3",
+                        "engine": "gtts", "errors": errors}
+            if err:
+                errors.append(err)
+
+    # TIER 3: in-browser SpeechSynthesis
+    return {"bytes": None, "b64": None, "mime": "",
+            "engine": "browser", "errors": errors}
 
 def fetch_simli_session_token(api_key: str, face_id: str) -> str | None:
     """Initializes a real-time WebRTC session token from Simli's API."""
@@ -483,10 +616,19 @@ def fetch_simli_session_token(api_key: str, face_id: str) -> str | None:
     except Exception:
         return "simli_connected"
 
-def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id: str):
+def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id: str,
+                            audio_mime: str = "audio/mp3", engine: str = "gtts"):
     """Renders the dark glassmorphic Video Avatar streaming container with defensive JS audio playback."""
     audio_src = audio_b64 or ""
     safe_q = question_text.replace('"', '&quot;')
+    question_json = json.dumps(question_text)
+    has_audio_js = "true" if audio_src else "false"
+    audio_element_html = (
+        f'<audio id="recruiterAudio" class="audio-control" preload="auto" playsinline>'
+        f'<source src="{audio_src}" type="{audio_mime}"></audio>'
+    ) if audio_src else ""
+    btn_label = "Play Audio" if audio_src else "Speak Question"
+
     html_code = f"""
     <!DOCTYPE html>
     <html>
@@ -620,7 +762,7 @@ def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id:
                     <span>AI Interviewer Active</span>
                 </div>
                 <button id="voiceBtn" class="play-btn" onclick="toggleAudio()">
-                    <span>🔊</span> <span id="btnLabel">Play Audio</span>
+                    <span>🔊</span> <span id="btnLabel">{btn_label}</span>
                 </button>
             </div>
             
@@ -629,81 +771,112 @@ def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id:
                     "{safe_q}"
                 </div>
             </div>
-            {f'''<audio id="recruiterAudio" class="audio-control" preload="auto" playsinline>
-                <source src="{audio_src}" type="audio/mp3">
-                <source src="{audio_src}" type="audio/mpeg">
-            </audio>''' if audio_src else ''}
+            {audio_element_html}
         </div>
         <script>
-            function toggleAudio() {{
-                const audio = document.getElementById('recruiterAudio');
-                const video = document.getElementById('avatarVideo');
-                const label = document.getElementById('btnLabel');
+            const QUESTION_TEXT = {question_json};
+            const HAS_SERVER_AUDIO = {has_audio_js};
 
-                if (!audio) {{
-                    console.error("Audio element #recruiterAudio not found");
+            function setLabel(txt) {{
+                const label = document.getElementById('btnLabel');
+                if (label) label.innerText = txt;
+            }}
+
+            function startVideo() {{
+                const video = document.getElementById('avatarVideo');
+                if (video) video.play().catch(e => console.warn("Video play blocked:", e));
+            }}
+
+            function stopVideo() {{
+                const video = document.getElementById('avatarVideo');
+                if (video) {{ video.pause(); video.currentTime = 0; }}
+            }}
+
+            // Tier 3: Browser-Native Speech Synthesis
+            function browserSpeak() {{
+                if (!('speechSynthesis' in window)) {{
+                    setLabel('Voice unsupported');
                     return;
                 }}
+                if (window.speechSynthesis.speaking) {{
+                    window.speechSynthesis.cancel();
+                    stopVideo();
+                    setLabel('Play Audio');
+                    return;
+                }}
+                const utter = new SpeechSynthesisUtterance(QUESTION_TEXT);
+                utter.lang = 'en-US';
+                utter.rate = 0.97;
+                utter.pitch = 1.0;
+
+                const voices = window.speechSynthesis.getVoices() || [];
+                const preferred = voices.find(v =>
+                    /en(-|_)(US|GB)/i.test(v.lang) && /natural|google|daniel|samantha/i.test(v.name)
+                ) || voices.find(v => /^en/i.test(v.lang));
+                if (preferred) utter.voice = preferred;
+
+                utter.onstart = () => {{ setLabel('Pause Audio'); startVideo(); }};
+                utter.onend   = () => {{ setLabel('Replay Audio'); stopVideo(); }};
+                utter.onerror = (e) => {{
+                    console.error("speechSynthesis error:", e);
+                    setLabel('Voice unavailable');
+                }};
+                window.speechSynthesis.speak(utter);
+            }}
+
+            // Tiers 1 & 2: Server-Synthesized Audio
+            function toggleAudio() {{
+                if (!HAS_SERVER_AUDIO) {{ browserSpeak(); return; }}
+
+                const audio = document.getElementById('recruiterAudio');
+                if (!audio) {{ browserSpeak(); return; }}
 
                 if (audio.paused) {{
-                    const playPromise = audio.play();
-                    if (playPromise !== undefined) {{
-                        playPromise.then(() => {{
-                            if (label) label.innerText = 'Pause Audio';
-                            if (video) {{
-                                video.play().catch(e => console.warn("Video play exception:", e));
-                            }}
-                        }}).catch(e => {{
-                            console.error("Audio playback failed:", e);
-                            if (label) label.innerText = '⚠️ Click to Play';
+                    audio.play()
+                        .then(() => {{ setLabel('Pause Audio'); startVideo(); }})
+                        .catch(e => {{
+                            console.error("Audio element playback failed:", e);
+                            browserSpeak();
                         }});
-                    }}
                 }} else {{
                     audio.pause();
-                    if (label) label.innerText = 'Play Audio';
+                    setLabel('Play Audio');
                 }}
             }}
 
             window.addEventListener('DOMContentLoaded', () => {{
-                const audio = document.getElementById('recruiterAudio');
-                const video = document.getElementById('avatarVideo');
-                const label = document.getElementById('btnLabel');
-
-                if (audio) {{
-                    audio.addEventListener('playing', () => {{
-                        if (label) label.innerText = 'Pause Audio';
-                        if (video) video.play().catch(e => console.warn("Video play exception:", e));
-                    }});
-                    audio.addEventListener('pause', () => {{
-                        if (label) label.innerText = 'Play Audio';
-                    }});
-                    audio.addEventListener('ended', () => {{
-                        if (label) label.innerText = 'Replay Audio';
-                        if (video) {{
-                            video.pause();
-                            video.currentTime = 0;
-                        }}
-                    }});
-                    audio.addEventListener('error', (err) => {{
-                        console.error("Audio error event encountered:", err);
-                        if (label) label.innerText = '⚠️ Audio Error';
-                    }});
-
-                    // Defensive initial autoplay trial
-                    const initPromise = audio.play();
-                    if (initPromise !== undefined) {{
-                        initPromise.catch(e => {{
-                            console.warn("Initial autoplay blocked by browser policy (user gesture required):", e);
-                            if (label) label.innerText = '🔊 Play Audio';
-                        }});
-                    }}
+                if ('speechSynthesis' in window) {{
+                    window.speechSynthesis.getVoices();
+                    window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
                 }}
+
+                const audio = document.getElementById('recruiterAudio');
+                if (!audio) {{
+                    setLabel(HAS_SERVER_AUDIO ? 'Play Audio' : '🔊 Speak Question');
+                    return;
+                }}
+
+                audio.addEventListener('playing', () => {{ setLabel('Pause Audio'); startVideo(); }});
+                audio.addEventListener('pause',   () => setLabel('Play Audio'));
+                audio.addEventListener('ended',   () => {{ setLabel('Replay Audio'); stopVideo(); }});
+                audio.addEventListener('error',   (err) => {{
+                    console.error("Audio element error:", err);
+                    setLabel('🔊 Speak Question');
+                }});
+
+                audio.play().catch(e => {{
+                    console.warn("Autoplay blocked by browser policy:", e);
+                    setLabel('🔊 Play Audio');
+                }});
             }});
         </script>
     </body>
     </html>
     """
-    components.html(html_code, height=450)
+    if hasattr(st, "iframe"):
+        st.iframe(html_code, height=450)
+    else:
+        components.html(html_code, height=450)
 
 # -----------------------------------------------------------------------------
 # Multimodal Audio Transcription
@@ -728,7 +901,6 @@ def transcribe_candidate_audio(audio_bytes: bytes, api_key: str, model_name: str
             st.error("🔑 **Authentication Notice**: The Google API key is invalid or unauthorized for Gemini. Please configure a valid Google AI Studio API key (starts with `AIzaSy...`). You can also type or edit your answer directly below.")
         else:
             st.warning(f"Voice Transcription Notice: {err_str[:120]}")
-        return ""
         return ""
 
 # -----------------------------------------------------------------------------
@@ -761,6 +933,33 @@ with st.sidebar:
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # Clean System Diagnostics Expander
+    with st.expander("🩺 System Diagnostics", expanded=False):
+        st.markdown(
+            f"**Gemini key:** {'✅ loaded' if active_api_key else '❌ missing'}  \n"
+            f"**google-genai SDK:** {'✅' if GEMINI_AVAILABLE else '❌'}  \n"
+            f"**gTTS installed:** {'✅' if GTTS_AVAILABLE else '❌'}  \n"
+            f"**Simli key:** {'✅ loaded' if simli_api_key else '➖ not set'}  \n"
+            f"**Model:** `{model_name}`"
+        )
+
+        engine_now = st.session_state.get("voice_engine") or "idle"
+        engine_desc = {
+            "gemini": "✅ Gemini Native TTS (Server)",
+            "gtts": "✅ Google TTS (Server)",
+            "browser": "⚠️ Browser Speech (Local)",
+        }.get(engine_now, f"➖ {engine_now}")
+        st.markdown(f"**Active voice engine:** {engine_desc}")
+
+        for msg in (st.session_state.get("voice_errors") or []):
+            st.caption(f"⚠️ {msg}")
+
+        if st.button("🔁 Rebuild voice cache", use_container_width=True):
+            st.session_state.media_cache = {}
+            synthesize_speech.clear()
+            st.toast("Voice cache cleared - audio will be re-synthesized.", icon="🔊")
+            st.rerun()
 
     st.markdown("<br><br>", unsafe_allow_html=True)
     if st.button("End Session", use_container_width=True, type="secondary"):
@@ -1034,13 +1233,24 @@ elif st.session_state.stage == "interview":
 
     if not media_data:
         with st.spinner("🎙️ Alex is preparing the question..."):
-            raw_audio, audio_uri = generate_gtts_audio(current_q["question"])
+            voice = synthesize_speech(current_q["question"], active_api_key, prefer="gemini")
+
+            media_data = {
+                "type": "simli" if simli_api_key else "audio",
+                "b64": voice["b64"],
+                "raw_bytes": voice["bytes"],
+                "mime": voice["mime"],
+                "engine": voice["engine"],
+                "errors": voice["errors"],
+            }
             if simli_api_key:
-                token = fetch_simli_session_token(simli_api_key, simli_face_id)
-                media_data = {"type": "simli", "b64": audio_uri, "raw_bytes": raw_audio, "token": token, "face_id": simli_face_id}
-            else:
-                media_data = {"type": "gtts_audio", "b64": audio_uri, "raw_bytes": raw_audio}
+                media_data["token"] = fetch_simli_session_token(simli_api_key, simli_face_id)
+                media_data["face_id"] = simli_face_id
+
             st.session_state.media_cache[cache_key] = media_data
+
+        st.session_state.voice_engine = media_data["engine"]
+        st.session_state.voice_errors = media_data["errors"]
 
     # Main Grid (Left: Avatar Feed, Right: Interaction Controls)
     col_left, col_right = st.columns([7, 5], gap="large")
@@ -1050,7 +1260,9 @@ elif st.session_state.stage == "interview":
         render_avatar_video_card(
             question_text=current_q["question"],
             audio_b64=media_data.get("b64"),
-            face_id=simli_face_id
+            face_id=simli_face_id,
+            audio_mime=media_data.get("mime") or "audio/mp3",
+            engine=media_data.get("engine") or "browser",
         )
 
         # Native Streamlit audio component underneath avatar card (handles HTTPS and cross-origin policies)
@@ -1063,8 +1275,31 @@ elif st.session_state.stage == "interview":
                 raw_audio_data = None
 
         if raw_audio_data:
-            st.markdown("<div style='margin-top: -6px; margin-bottom: 6px;'><span class='font-mono-tag' style='color: #94a3b8; font-size: 0.74rem;'>🔊 Interviewer Voice Player (HTTPS Native):</span></div>", unsafe_allow_html=True)
-            st.audio(raw_audio_data, format="audio/mp3", autoplay=True)
+            engine_label = {
+                "gemini": "Gemini Native TTS",
+                "gtts": "Google TTS",
+            }.get(media_data.get("engine"), "Voice")
+            st.markdown(
+                "<div style='margin-top: -6px; margin-bottom: 6px;'>"
+                "<span class='font-mono-tag' style='color: #94a3b8; font-size: 0.74rem;'>"
+                f"🔊 Interviewer Voice Player &middot; {engine_label}</span></div>",
+                unsafe_allow_html=True,
+            )
+            st.audio(
+                raw_audio_data,
+                format=media_data.get("mime") or "audio/mp3",
+                autoplay=True,
+            )
+        else:
+            st.markdown(
+                "<div style='margin-top: -6px; margin-bottom: 6px;'>"
+                "<span class='font-mono-tag' style='color: #fbbf24; font-size: 0.74rem;'>"
+                "🔊 Server voice fallback &middot; using in-browser speech. "
+                "Press <b>Speak Question</b> on the avatar card.</span></div>",
+                unsafe_allow_html=True,
+            )
+            for msg in (media_data.get("errors") or []):
+                st.caption(f"⚠️ {msg}")
 
     with col_right:
         # Question Context Card

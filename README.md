@@ -7,48 +7,60 @@ A production-grade AI-powered mock interview practice platform powered by **Goog
 ## ✨ Features
 
 - **Google Gemini Deep Reasoning Engine**:
-  - Powered by `gemini-3.6-flash` / `gemini-2.5-pro` using the official `google-genai` SDK.
-  - Generates deep, scenario-grounded technical & behavioral questions tailored to target job role, experience level, and candidate resume.
-  - Produces multi-dimensional, deep analytical evaluations strictly grounded in candidate transcripts with zero canned presets.
-- **Multimodal Voice & Audio Intelligence**:
-  - Live microphone recording with Gemini multimodal audio transcription (`audio/wav`).
-  - gTTS audio playback integrated via base64 `<audio autoplay>` for zero-friction listening.
+  - Powered by `gemini-3.6-flash` using the official `google-genai` SDK.
+  - Tailors screening questions to the candidate's uploaded resume or LinkedIn profile.
+  - Generates deep, multi-dimensional Bar Raiser evaluation reports with Plotly Competency Radar charts.
+- **Three-Tier Resilient Voice Engine**:
+  - **Tier 1 (Gemini Native TTS)**: Authenticated speech synthesis (`gemini-2.5-flash-preview-tts`) with voice `Charon`.
+  - **Tier 2 (Google TTS - gTTS)**: Free backup text-to-speech.
+  - **Tier 3 (Browser SpeechSynthesis)**: Client-side voice synthesis guaranteeing the avatar always speaks.
 - **Simli Real-Time Avatar Integration**:
-  - WebRTC-based live talking avatar stream with sub-300ms speech-to-video lip-syncing.
-- **Dynamic State Machine**:
-  - `Setup` ➡️ `Live Interview (3-5 Questions)` ➡️ `Deep Scorecard & Radar Chart`.
-- **Strict Input Validation**:
-  - Real-time word counter enforcing a minimum of 5 words before allowing answer submission.
-- **Comprehensive Scorecard**:
-  - Overall Score (0-100) & Hiring Recommendation badge.
+  - WebRTC-based live talking avatar stream with synchronized speech lip-syncing.
+- **Comprehensive Candidate Scorecard**:
+  - 0–100 Overall Fit Score & Hiring Recommendation badge.
   - Interactive Plotly Competency Radar Chart across 5 core dimensions.
-  - Detailed Question-by-Question Deep Dive with strengths, omissions, and gold-standard model STAR answers.
-  - Downloadable Markdown evaluation report (`.md`).
+  - Question-by-question breakdown comparing candidate transcripts with gold-standard STAR benchmark answers.
+  - Downloadable Markdown evaluation report.
 
 ---
 
 ## 🚀 Quickstart Guide
 
-### 1. Activate the Virtual Environment
-
-**Windows PowerShell:**
-```powershell
-.\venv\Scripts\Activate.ps1
-```
-
-**macOS / Linux:**
+### 1. Setup & Install Dependencies
 ```bash
+python -m venv venv
+# Windows:
+.\venv\Scripts\Activate.ps1
+# macOS / Linux:
 source venv/bin/activate
+
+pip install -r requirements.txt
 ```
 
-### 2. Launch the Application
+### 2. Configure Local Secrets
+Create a `.streamlit/secrets.toml` file (this file is excluded by `.gitignore`):
+```toml
+GEMINI_API_KEY = "your-gemini-api-key"
+SIMLI_API_KEY = "your-simli-api-key"
+SIMLI_FACE_ID = "5514e24d-6086-46a3-ace4-6a7264e5cb7c"
+```
+
+### 3. Launch the Application
 ```bash
 streamlit run app.py
 ```
 
 ---
 
-## 🔑 Secrets Configuration
+## ☁️ Deploy to Render
 
-Configure your keys in [`.streamlit/secrets.toml`](file:///.streamlit/secrets.toml):
-
+1. **Build Command**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. **Start Command**:
+   ```bash
+   streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+   ```
+3. **Environment Variables**:
+   Add `GEMINI_API_KEY`, `SIMLI_API_KEY`, and `SIMLI_FACE_ID` under your Render Web Service Environment settings.
