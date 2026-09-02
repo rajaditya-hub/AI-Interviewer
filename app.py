@@ -447,20 +447,26 @@ def get_canned_questions(job_title: str, focus: str, count: int) -> list:
 # -----------------------------------------------------------------------------
 # Audio & Simli Real-Time Avatar Generation
 # -----------------------------------------------------------------------------
-def generate_gtts_audio_base64(text: str) -> str | None:
-    """Generates MP3 audio using gTTS and converts to a base64 data URI."""
+def generate_gtts_audio(text: str) -> tuple[bytes | None, str | None]:
+    """Generates MP3 audio using gTTS and returns (raw_bytes, base64_data_uri)."""
     if not GTTS_AVAILABLE:
-        return None
+        return None, None
     try:
         clean_text = re.sub(r'[*_#`~]', '', text)
         tts = gTTS(text=clean_text, lang='en', tld='com')
         fp = io.BytesIO()
         tts.write_to_fp(fp)
         fp.seek(0)
-        b64_data = base64.b64encode(fp.read()).decode("utf-8")
-        return f"data:audio/mp3;base64,{b64_data}"
+        raw_bytes = fp.read()
+        b64_data = base64.b64encode(raw_bytes).decode("utf-8")
+        return raw_bytes, f"data:audio/mp3;base64,{b64_data}"
     except Exception:
-        return None
+        return None, None
+
+def generate_gtts_audio_base64(text: str) -> str | None:
+    """Convenience helper returning base64 URI."""
+    _, uri = generate_gtts_audio(text)
+    return uri
 
 def fetch_simli_session_token(api_key: str, face_id: str) -> str | None:
     """Initializes a real-time WebRTC session token from Simli's API."""
@@ -478,7 +484,7 @@ def fetch_simli_session_token(api_key: str, face_id: str) -> str | None:
         return "simli_connected"
 
 def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id: str):
-    """Renders the dark glassmorphic Video Avatar streaming container matching the provided HTML."""
+    """Renders the dark glassmorphic Video Avatar streaming container with defensive JS audio playback."""
     audio_src = audio_b64 or ""
     safe_q = question_text.replace('"', '&quot;')
     html_code = f"""
@@ -613,7 +619,7 @@ def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id:
                     <span class="pulse-dot"></span>
                     <span>AI Interviewer Active</span>
                 </div>
-                <button id="voiceBtn" class="play-btn">
+                <button id="voiceBtn" class="play-btn" onclick="toggleAudio()">
                     <span>🔊</span> <span id="btnLabel">Play Audio</span>
                 </button>
             </div>
@@ -623,49 +629,76 @@ def render_avatar_video_card(question_text: str, audio_b64: str | None, face_id:
                     "{safe_q}"
                 </div>
             </div>
-            {f'<audio id="recruiterAudio" class="audio-control" autoplay src="{audio_src}"></audio>' if audio_src else ''}
+            {f'''<audio id="recruiterAudio" class="audio-control" preload="auto" playsinline>
+                <source src="{audio_src}" type="audio/mp3">
+                <source src="{audio_src}" type="audio/mpeg">
+            </audio>''' if audio_src else ''}
         </div>
         <script>
-            const video = document.getElementById('avatarVideo');
-            const audio = document.getElementById('recruiterAudio');
-            const btn = document.getElementById('voiceBtn');
-            const label = document.getElementById('btnLabel');
-
             function toggleAudio() {{
-                if (!audio) return;
+                const audio = document.getElementById('recruiterAudio');
+                const video = document.getElementById('avatarVideo');
+                const label = document.getElementById('btnLabel');
+
+                if (!audio) {{
+                    console.error("Audio element #recruiterAudio not found");
+                    return;
+                }}
+
                 if (audio.paused) {{
-                    audio.play().then(() => {{
-                        if (label) label.innerText = 'Pause Audio';
-                        if (video) video.play();
-                    }}).catch(err => console.log('Autoplay policy error:', err));
+                    const playPromise = audio.play();
+                    if (playPromise !== undefined) {{
+                        playPromise.then(() => {{
+                            if (label) label.innerText = 'Pause Audio';
+                            if (video) {{
+                                video.play().catch(e => console.warn("Video play exception:", e));
+                            }}
+                        }}).catch(e => {{
+                            console.error("Audio playback failed:", e);
+                            if (label) label.innerText = '⚠️ Click to Play';
+                        }});
+                    }}
                 }} else {{
                     audio.pause();
                     if (label) label.innerText = 'Play Audio';
                 }}
             }}
 
-            if (btn) {{
-                btn.addEventListener('click', toggleAudio);
-            }}
+            window.addEventListener('DOMContentLoaded', () => {{
+                const audio = document.getElementById('recruiterAudio');
+                const video = document.getElementById('avatarVideo');
+                const label = document.getElementById('btnLabel');
 
-            if (audio && video) {{
-                audio.addEventListener('play', () => {{
-                    if (label) label.innerText = 'Playing...';
-                    video.play().catch(e => console.log(e));
-                }});
-                audio.addEventListener('pause', () => {{
-                    if (label) label.innerText = 'Play Audio';
-                }});
-                audio.addEventListener('ended', () => {{
-                    if (label) label.innerText = 'Replay Audio';
-                    video.pause();
-                    video.currentTime = 0;
-                }});
-                // Attempt initial autoplay if allowed
-                audio.play().catch(() => {{
-                    if (label) label.innerText = '🔊 Click to Play';
-                }});
-            }}
+                if (audio) {{
+                    audio.addEventListener('playing', () => {{
+                        if (label) label.innerText = 'Pause Audio';
+                        if (video) video.play().catch(e => console.warn("Video play exception:", e));
+                    }});
+                    audio.addEventListener('pause', () => {{
+                        if (label) label.innerText = 'Play Audio';
+                    }});
+                    audio.addEventListener('ended', () => {{
+                        if (label) label.innerText = 'Replay Audio';
+                        if (video) {{
+                            video.pause();
+                            video.currentTime = 0;
+                        }}
+                    }});
+                    audio.addEventListener('error', (err) => {{
+                        console.error("Audio error event encountered:", err);
+                        if (label) label.innerText = '⚠️ Audio Error';
+                    }});
+
+                    // Defensive initial autoplay trial
+                    const initPromise = audio.play();
+                    if (initPromise !== undefined) {{
+                        initPromise.catch(e => {{
+                            console.warn("Initial autoplay blocked by browser policy (user gesture required):", e);
+                            if (label) label.innerText = '🔊 Play Audio';
+                        }});
+                    }}
+                }}
+            }});
         </script>
     </body>
     </html>
@@ -1001,12 +1034,12 @@ elif st.session_state.stage == "interview":
 
     if not media_data:
         with st.spinner("🎙️ Alex is preparing the question..."):
-            audio_uri = generate_gtts_audio_base64(current_q["question"])
+            raw_audio, audio_uri = generate_gtts_audio(current_q["question"])
             if simli_api_key:
                 token = fetch_simli_session_token(simli_api_key, simli_face_id)
-                media_data = {"type": "simli", "b64": audio_uri, "token": token, "face_id": simli_face_id}
+                media_data = {"type": "simli", "b64": audio_uri, "raw_bytes": raw_audio, "token": token, "face_id": simli_face_id}
             else:
-                media_data = {"type": "gtts_audio", "b64": audio_uri}
+                media_data = {"type": "gtts_audio", "b64": audio_uri, "raw_bytes": raw_audio}
             st.session_state.media_cache[cache_key] = media_data
 
     # Main Grid (Left: Avatar Feed, Right: Interaction Controls)
@@ -1019,13 +1052,19 @@ elif st.session_state.stage == "interview":
             audio_b64=media_data.get("b64"),
             face_id=simli_face_id
         )
-        if media_data and media_data.get("b64"):
+
+        # Native Streamlit audio component underneath avatar card (handles HTTPS and cross-origin policies)
+        raw_audio_data = media_data.get("raw_bytes")
+        if raw_audio_data is None and media_data.get("b64"):
             try:
                 raw_b64 = media_data["b64"].split(",")[-1]
-                audio_raw_bytes = base64.b64decode(raw_b64)
-                st.audio(audio_raw_bytes, format="audio/mp3")
+                raw_audio_data = base64.b64decode(raw_b64)
             except Exception:
-                pass
+                raw_audio_data = None
+
+        if raw_audio_data:
+            st.markdown("<div style='margin-top: -6px; margin-bottom: 6px;'><span class='font-mono-tag' style='color: #94a3b8; font-size: 0.74rem;'>🔊 Interviewer Voice Player (HTTPS Native):</span></div>", unsafe_allow_html=True)
+            st.audio(raw_audio_data, format="audio/mp3", autoplay=True)
 
     with col_right:
         # Question Context Card
