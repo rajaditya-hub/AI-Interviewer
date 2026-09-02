@@ -4,6 +4,7 @@ import json
 import base64
 import hashlib
 import time
+import random
 import io
 import wave
 import datetime
@@ -383,38 +384,81 @@ def get_gemini_client(api_key: str):
 
 def call_gemini_json(prompt: str, system_prompt: str, api_key: str, model_name: str) -> tuple[dict | None, str | None]:
     """
-    Calls Google Gemini with structured JSON output configuration.
+    Calls Google Gemini with structured JSON output configuration, featuring
+    exponential backoff with jitter and model fallback for transient failures.
     Returns (result_dict, error_message).
     """
     if not api_key:
         return None, "Gemini API Key is missing. Please configure GEMINI_API_KEY in .streamlit/secrets.toml."
     if not GEMINI_AVAILABLE:
         return None, "google-genai SDK is not installed in the environment."
-    try:
-        client = get_gemini_client(api_key)
-        if not client:
-            return None, "Failed to initialize Google Gemini client. Check API key."
 
-        config = types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            response_mime_type="application/json",
-            temperature=0.3
-        )
-        response = client.models.generate_content(
-            model=model_name or DEFAULT_GEMINI_MODEL,
-            contents=prompt,
-            config=config
-        )
-        content = response.text or ""
-        try:
-            return json.loads(content), None
-        except json.JSONDecodeError:
-            match = re.search(r"\{[\s\S]*\}", content)
-            if match:
-                return json.loads(match.group(0)), None
-            return None, f"Failed to parse JSON output: {content[:200]}"
-    except Exception as e:
-        return None, f"Google Gemini API Error: {str(e)}"
+    client = get_gemini_client(api_key)
+    if not client:
+        return None, "Failed to initialize Google Gemini client. Check API key."
+
+    def is_non_retryable(err_str: str) -> bool:
+        upper = err_str.upper()
+        non_retryable_keywords = [
+            "401", "403", "UNAUTHENTICATED", "PERMISSION_DENIED",
+            "API_KEY_INVALID", "400", "INVALID_ARGUMENT"
+        ]
+        return any(kw in upper for kw in non_retryable_keywords)
+
+    def is_retryable(err_str: str) -> bool:
+        upper = err_str.upper()
+        retryable_keywords = [
+            "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
+            "500", "INTERNAL", "DEADLINE_EXCEEDED", "OVERLOADED", "HIGH DEMAND"
+        ]
+        return any(kw in upper for kw in retryable_keywords)
+
+    # Build model chain: requested model first, then "gemini-3.5-flash", then "gemini-flash-latest" without duplicates
+    primary_model = model_name or DEFAULT_GEMINI_MODEL
+    raw_chain = [primary_model, "gemini-3.5-flash", "gemini-flash-latest"]
+    models_chain = []
+    for m in raw_chain:
+        if m and m not in models_chain:
+            models_chain.append(m)
+
+    backoff_delays = [2.0, 4.0, 8.0]
+
+    for target_model in models_chain:
+        for attempt in range(3):
+            try:
+                config = types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    response_mime_type="application/json",
+                    temperature=0.3
+                )
+                response = client.models.generate_content(
+                    model=target_model,
+                    contents=prompt,
+                    config=config
+                )
+                content = response.text or ""
+                try:
+                    return json.loads(content), None
+                except json.JSONDecodeError:
+                    match = re.search(r"\{[\s\S]*\}", content)
+                    if match:
+                        return json.loads(match.group(0)), None
+                    return None, f"Failed to parse JSON output: {content[:200]}"
+            except Exception as e:
+                err_str = str(e)
+                if is_non_retryable(err_str):
+                    return None, f"Google Gemini API Error: Authentication or request invalid ({err_str[:120]})"
+
+                # If retryable, sleep with exponential backoff + jitter if attempts remain on this model
+                if attempt < 2:
+                    delay = backoff_delays[attempt] + random.uniform(0.1, 0.5)
+                    time.sleep(delay)
+                else:
+                    # 3 attempts exhausted on target_model, move to next model in chain
+                    break
+
+    chain_str = ", ".join(models_chain)
+    return None, f"Gemini is temporarily overloaded (503). Tried {chain_str}. Please retry in a moment."
 
 # -----------------------------------------------------------------------------
 # Setup Question Generation Fallback (Structured Scenarios)
@@ -1204,11 +1248,13 @@ Output strict JSON format:
     ]
 }}
 """
-                    res, _ = call_gemini_json(user_prompt, system_prompt, active_api_key, model_name)
+                    res, gen_error = call_gemini_json(user_prompt, system_prompt, active_api_key, model_name)
                     if res and "questions" in res and isinstance(res["questions"], list) and len(res["questions"]) > 0:
                         questions = res["questions"][:3]
 
                 if not questions:
+                    if gen_error:
+                        st.warning(f"⚠️ {gen_error}")
                     questions = get_canned_questions("Senior Software Engineer", "System Architecture & Optimization", 3)
 
                 st.session_state.questions = questions
@@ -1520,8 +1566,14 @@ Output JSON schema:
         </div>
         """, unsafe_allow_html=True)
 
-        if st.button("🔄 Back to Setup", type="primary"):
-            reset_interview()
+        col_retry, col_setup = st.columns([1.2, 1])
+        with col_retry:
+            if st.button("🔄 Retry Evaluation", type="primary", use_container_width=True):
+                st.session_state.evaluation = None
+                st.rerun()
+        with col_setup:
+            if st.button("Back to Setup", type="secondary", use_container_width=True):
+                reset_interview()
 
     else:
         overall_score = ev.get("overall_score", 84)
