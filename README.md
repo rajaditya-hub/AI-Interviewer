@@ -52,8 +52,3 @@ streamlit run app.py
 
 Configure your keys in [`.streamlit/secrets.toml`](file:///.streamlit/secrets.toml):
 
-```toml
-GEMINI_API_KEY = "AQ.Ab8RN6JT1UBbZOb52ofuVApf2z67uV5ClPXOgsbmL9zKDFgQGw"
-SIMLI_API_KEY = "ld242v8he7ezmu1a4d2glk"
-SIMLI_FACE_ID = "5514e24d-6086-46a3-ace4-6a7264e5cb7c"
-```
