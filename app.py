@@ -539,7 +539,13 @@ def generate_gemini_tts_audio(text: str, api_key: str) -> tuple[bytes | None, st
             return raw, mime, ""
 
         except Exception as exc:
-            last_error = f"{tts_model}: {exc}"
+            err_msg = str(exc)
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                last_error = f"{tts_model}: Gemini TTS free tier quota limit reached."
+            elif "401" in err_msg or "UNAUTHENTICATED" in err_msg:
+                last_error = f"{tts_model}: Authentication key unauthorized."
+            else:
+                last_error = f"{tts_model}: {err_msg[:80]}"
             continue
 
     return None, "", f"Gemini TTS unavailable: {last_error}"
@@ -1290,16 +1296,6 @@ elif st.session_state.stage == "interview":
                 format=media_data.get("mime") or "audio/mp3",
                 autoplay=True,
             )
-        else:
-            st.markdown(
-                "<div style='margin-top: -6px; margin-bottom: 6px;'>"
-                "<span class='font-mono-tag' style='color: #fbbf24; font-size: 0.74rem;'>"
-                "🔊 Server voice fallback &middot; using in-browser speech. "
-                "Press <b>Speak Question</b> on the avatar card.</span></div>",
-                unsafe_allow_html=True,
-            )
-            for msg in (media_data.get("errors") or []):
-                st.caption(f"⚠️ {msg}")
 
     with col_right:
         # Question Context Card
